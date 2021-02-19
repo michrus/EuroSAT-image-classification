@@ -3,110 +3,90 @@
 import argparse
 import os
 from collections import namedtuple
+from math import sqrt
 
 import torch
 import torchvision
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import models, transforms
-from tqdm import tqdm
+from torch.utils.data import Dataset, TensorDataset
+import numpy as np
 
-from dataset import EuroSAT, ImageFiles, random_split
+import cv2 as cv
+
+import split_imgs
 
 # to be sure that we don't mix them, use this instead of a tuple
 TestResult = namedtuple('TestResult', 'truth predictions')
 
+class NumpyArrays(Dataset):
+    """
+    Generic numpy array data loader
+    """
+
+    def __init__(self, arrays: np.array, transform=None):
+        self.arrays = arrays
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.arrays)
+
+    def __getitem__(self, idx):
+        image = self.arrays[idx]
+        if self.transform is not None:
+            image = self.transform(image)
+        # WARNING -1 indicates no target, it's useful to keep the same interface as torchvision
+        return image, -1
+
+def map_to_color(predicted_class):
+    color_map = {
+        0: (240, 216, 62), # anual crop
+        1: (23, 94, 33), # forest
+        2: (114, 186, 124), # herbaceous vegetation
+        3: (97, 97, 97), # highway
+        4: (120, 86, 0), # industrial
+        5: (119, 255, 0), # pasture
+        6: (255, 217, 0), # permanent crop
+        7: (255, 255, 255), # residential
+        8: (92, 250, 255), # river
+        9: (30, 26, 171) # sea or lake
+    }
+    return np.array(color_map.get(predicted_class,(0,0,0))).astype('float32')
 
 @torch.no_grad()
-def predict(model: nn.Module, dl: torch.utils.data.DataLoader, paths=None, show_progress=True):
+def predict_mask(image, chunks_num, model_path, batch_size=8, workers=4):
     """
     Run the model on the specified data.
     Automatically moves the samples to the same device as the model.
     """
-    if show_progress:
-        dl = tqdm(dl, "Predict", unit="batch")
+    save = torch.load(model_path, map_location='cpu')
+    normalization = save['normalization']
+    model = models.resnet50(num_classes=save['model_state']['fc.bias'].numel())
+    model.load_state_dict(save['model_state'])
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    tr = transforms.Compose([transforms.ToTensor(), transforms.Normalize(**normalization)])
+    splitted = split_imgs.split(image, chunks_num)
+    test = NumpyArrays(splitted, transform=tr)
+    test_dl = torch.utils.data.DataLoader(
+        test, batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=True
+    )
+
     device = next(model.parameters()).device
 
     model.eval()
     preds = []
-    truth = []
-    i = 0
-    for images, labels in dl:
+    for images, _ in test_dl:
         images = images.to(device, non_blocking=True)
         p = model(images).argmax(1).tolist()
         preds += p
-        truth += labels.tolist()
 
-        if paths:
-            for pred in p:
-                print(f"{paths[i]!r}, {pred}")
-                i += 1
+    chunks_dim = int(sqrt(chunks_num))
+    preds_np = np.array(preds).reshape(chunks_dim, chunks_dim)
+    g = np.vectorize(map_to_color, signature='()->(n)')
+    color_mask = g(preds_np)
 
-    return TestResult(truth=torch.as_tensor(truth), predictions=torch.as_tensor(preds))
+    resized = cv.resize(color_mask, image.shape[:-1], cv.INTER_NEAREST)
 
-
-def report(result: TestResult, label_names):
-    from sklearn.metrics import classification_report, confusion_matrix
-
-    cr = classification_report(result.truth, result.predictions, target_names=label_names, digits=3)
-    confusion = confusion_matrix(result.truth, result.predictions)
-
-    try:  # add names if pandas is installed, otherwise don't bother but don't crash
-        import pandas as pd
-
-        # keep only initial for columns (or it's too wide when printed)
-        confusion = pd.DataFrame(confusion, index=label_names, columns=[s[:3] for s in label_names])
-    except ImportError:
-        pass
-
-    print("Classification report")
-    print(cr)
-    print("Confusion matrix")
-    print(confusion)
-
-
-def main(args):
-    save = torch.load(args.model, map_location='cpu')
-    normalization = save['normalization']
-    model = models.resnet50(num_classes=save['model_state']['fc.bias'].numel())
-    model.load_state_dict(save['model_state'])
-    model = model.to(args.device)
-
-    tr = transforms.Compose([transforms.ToTensor(), transforms.Normalize(**normalization)])
-    if args.files:
-        test = ImageFiles(args.files, transform=tr)
-    else:
-        dataset = EuroSAT(transform=tr)
-        trainval, test = random_split(dataset, 0.9, random_state=42)
-
-    test_dl = torch.utils.data.DataLoader(
-        test, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True
-    )
-    result = predict(model, test_dl, paths=args.files)
-
-    if not args.files:  # this is the test, so we need to analyze results
-        report(result, dataset.classes)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="""Predict the label on the specified files and outputs the results in csv format.
-            If no file is specified, then run on the test set of EuroSAT and produce a report.""",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        '-m', '--model', default='weights/best.pt', type=str, help="Model to use for prediction"
-    )
-    parser.add_argument(
-        '-j',
-        '--workers',
-        default=4,
-        type=int,
-        metavar='N',
-        help="Number of workers for the DataLoader",
-    )
-    parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N')
-    parser.add_argument('files', nargs='*', help="Files to run prediction on")
-    args = parser.parse_args()
-    args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    main(args)
+    return resized
